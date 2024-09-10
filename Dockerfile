@@ -19,9 +19,8 @@ RUN go build -o /bin/myapp
 # Stage 3: Final
 FROM ubuntu:jammy
 COPY --from=builder /go/bin/playwright /
-RUN apt-get update && apt-get install -y ca-certificates tzdata \
-    # Install dependencies and all browsers (or specify one)
-    && /playwright install --with-deps \
+RUN apt-get update && apt-get install -y ca-certificates tzdata
+RUN  /playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /bin/myapp /
 CMD ["/myapp"]
