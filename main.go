@@ -1,26 +1,30 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"github.com/gin-gonic/gin"
 	"github.com/playwright-community/playwright-go"
+	"io"
 	"log"
+	"net/http"
 	url_tools "net/url"
-	"os"
-	"strconv"
+	"sync"
 	"time"
 )
 
 var (
-	url        = "https://linux.do/"
-	email      = ""
-	password   = ""
-	topicCount = 3
+	url               = "https://linux.do/"
+	defaultTopicCount = 3
 )
 
-func run() {
+func run(cookie string, topicCount int, logF logFunc, errF logFunc) error {
 	pw, err := playwright.Run()
 	if err != nil {
-		log.Fatalf("could not start Playwright: %v", err)
+		log.Printf("could not start Playwright: %v", err)
+		errF(fmt.Sprintf("could not start Playwright: %v", err))
+		return errors.New("could not start Playwright")
 	}
 	defer pw.Stop()
 
@@ -29,39 +33,64 @@ func run() {
 		Headless: playwright.Bool(true),
 	})
 	if err != nil {
-		log.Fatalf("could not launch browser: %v", err)
+		log.Printf("could not launch browser: %v", err)
+		errF(fmt.Sprintf("could not launch browser: %v", err))
+		return errors.New("could not launch browser")
 	}
 	defer browser.Close()
 
-	page, err := browser.NewPage()
+	context, err := browser.NewContext()
 	if err != nil {
-		log.Fatalf("could not create page: %v", err)
+		log.Printf("could not create context: %v", err)
+		errF(fmt.Sprintf("could not create context: %v", err))
+		return errors.New("could not create context")
+	}
+	defer context.Close()
+	context.AddCookies([]playwright.OptionalCookie{
+		{
+			Name:     "_t",
+			Value:    cookie,
+			URL:      nil,
+			Domain:   playwright.String("linux.do"),
+			Path:     playwright.String("/"),
+			Expires:  nil,
+			HttpOnly: playwright.Bool(true),
+			Secure:   playwright.Bool(true),
+			SameSite: playwright.SameSiteAttributeLax,
+		},
+	})
+
+	page, err := context.NewPage()
+	if err != nil {
+		log.Printf("could not create page: %v", err)
+		errF(fmt.Sprintf("could not create page: %v", err))
+		return errors.New("could not create page")
 	}
 
 	page.OnRequest(func(request playwright.Request) {
 		log.Printf("Request: %s %s", request.Method(), request.URL())
+		logF(fmt.Sprintf("Request: %s %s", request.Method(), request.URL()))
 	})
 
 	page.OnResponse(func(response playwright.Response) {
 		log.Printf("Response: %d %s", response.Status(), response.URL())
+		logF(fmt.Sprintf("Response: %d %s", response.Status(), response.URL()))
 	})
 
 	_, err = page.Goto(url)
 	if err != nil {
-		log.Fatalf("could not go to url: %v", err)
+		log.Printf("could not go to url: %v", err)
+		errF(fmt.Sprintf("could not go to url: %v", err))
+		return errors.New("could not go to url")
 	}
-	time.Sleep(5 * time.Second)
-	// Login
-	page.Click(".login-button .d-button-label")
-	page.Fill("#login-account-name", email)
-	page.Fill("#login-account-password", password)
-	page.Click("#login-button")
 
 	time.Sleep(5 * time.Second)
 
 	userInfo, _ := page.QuerySelector("#toggle-current-user")
 	if userInfo == nil {
-		log.Fatalf("could not find user info")
+		log.Printf("could not find user info")
+		errF("could not find user info")
+		return errors.New("could not find user info")
 	}
 	ariaLabel, _ := userInfo.GetAttribute("aria-label")
 	fmt.Println("======================================")
@@ -71,11 +100,15 @@ func run() {
 	// Get all links
 	topicListBody, err := page.QuerySelector("tbody.topic-list-body")
 	if err != nil {
-		log.Fatalf("could not find topic list body: %v", err)
+		log.Printf("could not find topic list body: %v", err)
+		errF("could not find topic list body")
+		return errors.New("could not find topic list body")
 	}
 	links, err := topicListBody.QuerySelectorAll("a.title.raw-link.raw-topic-link")
 	if err != nil {
-		log.Fatalf("could not find links: %v", err)
+		log.Printf("could not find links: %v", err)
+		errF("could not find links")
+		return errors.New("could not find links")
 	}
 
 	topics := make([]string, 0)
@@ -127,21 +160,99 @@ func run() {
 
 		time.Sleep(2 * time.Second)
 	}
+	return nil
+}
+
+var data struct {
+	TopicCount int    `json:"topic_count"`
+	Cookie     string `json:"cookie"`
+}
+
+type logFunc func(s string)
+
+func toLogFunc(ctx context.Context, logc chan string) logFunc {
+	return func(s string) {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Println(err)
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			return
+		case logc <- s:
+		}
+	}
+
 }
 
 func main() {
-	email = os.Getenv("EMAIL")
-	password = os.Getenv("PASSWORD")
-	count := os.Getenv("TOPIC_COUNT")
-	if count != "" {
-		c, err := strconv.ParseInt(count, 10, 64)
-		if err != nil {
-			log.Fatalf("could not parse TOPIC_COUNT: %v", err)
+	r := gin.Default()
+	r.POST("/run", func(c *gin.Context) {
+
+		if err := c.ShouldBindJSON(&data); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
-		topicCount = int(c)
-	}
-	if email == "" || password == "" {
-		log.Fatalf("EMAIL and PASSWORD environment variables must be set")
-	}
-	run()
+
+		if data.TopicCount == 0 {
+			data.TopicCount = defaultTopicCount
+		}
+
+		c.Header("Content-Type", "text/event-stream; charset=UTF-8")
+
+		// 创建一个通道来发送事件
+		logChan := make(chan string, 100)
+		logChanOnce := sync.Once{}
+		defer logChanOnce.Do(func() {
+			close(logChan)
+		})
+
+		errChan := make(chan string, 1)
+		errChanOnce := sync.Once{}
+		defer errChanOnce.Do(func() {
+			close(errChan)
+		})
+
+		go func() {
+			// 关闭请求
+			<-c.Request.Context().Done()
+			fmt.Println("Client cancelled the request")
+			logChanOnce.Do(func() {
+				close(logChan)
+			})
+			errChanOnce.Do(func() {
+				close(errChan)
+			})
+
+			for _ = range logChan {
+				// do nothing
+			}
+
+		}()
+
+		go func() {
+			run(data.Cookie, data.TopicCount, toLogFunc(c.Request.Context(), logChan), toLogFunc(c.Request.Context(), errChan))
+		}()
+
+		c.Stream(func(w io.Writer) bool {
+			select {
+			case msg, ok := <-logChan:
+				if !ok {
+					return false
+				}
+				c.SSEvent("message", msg)
+				return true
+			case err, ok := <-errChan:
+				if !ok {
+					return false
+				}
+				c.SSEvent("error", err)
+				return false
+			}
+		})
+		return
+	})
+	r.Run(":8899")
+
 }
